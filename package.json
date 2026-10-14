@@ -1,0 +1,38 @@
+{
+  "name": "codex-bridge-mcp",
+  "version": "0.1.0",
+  "scripts": {
+    "check": "node --check server.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "codex",
+    "model-context-protocol",
+    "multi-agent",
+    "code-review"
+  ],
+  "author": "WeiqiZhou2002",
+  "license": "MIT",
+  "description": "Two-way MCP bridge that lets Claude Code drive the Codex CLI (execute plans, adversarial plan review) while Codex can ask Claude questions back.",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.76"
+  },
+  "bin": {
+    "codex-bridge-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WeiqiZhou2002/codex-bridge-mcp.git"
+  }
+}
