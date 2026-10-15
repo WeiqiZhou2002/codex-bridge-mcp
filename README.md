@@ -23,6 +23,12 @@ Claude Code ──MCP "codex"──▶ server.mjs ──spawns──▶ codex ex
 ## Install
 
 ```bash
+claude mcp add codex -s user -- npx -y codex-bridge-mcp
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/WeiqiZhou2002/codex-bridge-mcp.git
 cd codex-bridge-mcp && npm install
 claude mcp add codex -s user -- node "$PWD/server.mjs"
