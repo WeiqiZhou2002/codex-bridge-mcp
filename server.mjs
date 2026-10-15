@@ -33,6 +33,7 @@ const argOf = (flag) => {
 const ROOT = argOf("--home") || process.env.CODEX_BRIDGE_HOME || path.join(os.homedir(), ".codex-bridge");
 const JOBS = path.join(ROOT, "jobs");
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
+const VERSION = readJson(path.join(path.dirname(SELF), "package.json"), {}).version || "0.0.0";
 
 // ---------- mailbox helpers ----------
 
@@ -83,6 +84,15 @@ const metaPath = (id) => path.join(jobDir(id), "meta.json");
 const eventsPath = (id) => path.join(jobDir(id), "events.jsonl");
 const inboxPath = (id) => path.join(jobDir(id), "inbox.jsonl");
 const answerPath = (id, qid) => path.join(jobDir(id), "answers", `${qid}.json`);
+const inboxCursorPath = (id) => path.join(jobDir(id), "inbox.cursor");
+
+// Claude -> Codex messages Codex has not picked up yet; marks them delivered.
+function takeUndelivered(id) {
+  const all = readLines(inboxPath(id));
+  const fresh = all.slice(readJson(inboxCursorPath(id), 0));
+  if (fresh.length) writeJson(inboxCursorPath(id), all.length);
+  return fresh;
+}
 
 function loadMeta(id) {
   const meta = readJson(metaPath(id), null);
@@ -124,22 +134,17 @@ async function runCodexSide(jobId) {
     console.error(`codex-bridge: missing or unknown --job ${jobId}`);
     process.exit(1);
   }
-  const cursorFile = path.join(jobDir(jobId), "inbox.cursor");
-
   // Any messages Claude queued for Codex ride along on every bridge tool result.
   function drainInbox() {
-    const all = readLines(inboxPath(jobId));
-    const seen = readJson(cursorFile, 0);
-    const fresh = all.slice(seen);
+    const fresh = takeUndelivered(jobId);
     if (!fresh.length) return "";
-    writeJson(cursorFile, all.length);
     return (
       "\n\n--- New message(s) from Claude ---\n" +
       fresh.map((m) => `[${m.ts}] ${m.text}`).join("\n\n")
     );
   }
 
-  const server = new McpServer({ name: "claude_bridge", version: "1.0.0" });
+  const server = new McpServer({ name: "claude_bridge", version: VERSION });
 
   server.registerTool(
     "ask_claude",
@@ -247,15 +252,17 @@ If the plan is genuinely sound, say so plainly and list only the top residual ri
 const DEFAULT_SANDBOX = { execute: "workspace-write", review: "read-only", freeform: "workspace-write" };
 
 const running = new Map(); // jobId -> ChildProcess
-const cursors = new Map(); // jobId -> number of events already shown to Claude
 
-function getCursor(id) {
-  if (!cursors.has(id)) cursors.set(id, readJson(path.join(jobDir(id), "claude.cursor"), 0));
-  return cursors.get(id);
-}
-function setCursor(id, n) {
-  cursors.set(id, n);
-  writeJson(path.join(jobDir(id), "claude.cursor"), n);
+// Number of events already shown to Claude. Kept on disk only, so several Claude sessions sharing a job agree.
+const getCursor = (id) => readJson(path.join(jobDir(id), "claude.cursor"), 0);
+const setCursor = (id, n) => writeJson(path.join(jobDir(id), "claude.cursor"), n);
+
+// Hands Claude everything it has not seen yet and marks it seen.
+function takeUnread(id) {
+  const all = readLines(eventsPath(id));
+  const fresh = all.slice(getCursor(id));
+  setCursor(id, all.length);
+  return fresh;
 }
 
 function bridgeConfigArgs(jobId) {
@@ -291,7 +298,8 @@ function runTurn(jobId, prompt) {
   writeJson(metaPath(jobId), meta);
 
   const ev = eventsPath(jobId);
-  appendLine(ev, { type: "turn_started", turn: meta.turns });
+  const turn = meta.turns;
+  appendLine(ev, { type: "turn_started", turn });
 
   const child = spawn(CODEX_BIN, args, { cwd: meta.cwd, stdio: ["pipe", "pipe", "pipe"], env: process.env });
   running.set(jobId, child);
@@ -347,20 +355,35 @@ function runTurn(jobId, prompt) {
   child.on("close", (code, signal) => {
     running.delete(jobId);
     const m = loadMeta(jobId);
+    // Messages Claude queued that Codex never picked up before the turn ended.
+    const undelivered = takeUndelivered(jobId);
     if (m.status === "cancelled") {
-      appendLine(ev, { type: "turn_cancelled" });
+      appendLine(ev, { type: "turn_cancelled", turn });
     } else if (code === 0 && !failed) {
       m.status = "idle";
-      appendLine(ev, { type: "turn_done", text: lastMessage ?? "(Codex produced no final message)" });
+      appendLine(ev, { type: "turn_done", turn, text: lastMessage ?? "(Codex produced no final message)" });
     } else {
       m.status = "failed";
       appendLine(ev, {
         type: "turn_failed",
+        turn,
         text: `exit ${code}${signal ? ` (${signal})` : ""}: ${failed || stderrTail.trim() || "unknown error"}`,
       });
     }
     m.updated = now();
     writeJson(metaPath(jobId), m);
+
+    if (!undelivered.length) return;
+    const texts = undelivered.map((u) => u.text);
+    if (m.status === "idle") {
+      appendLine(ev, { type: "auto_resume", turn: turn + 1, count: texts.length });
+      runTurn(
+        jobId,
+        `Claude sent you the following after you had already finished your last answer. Act on it:\n\n${texts.join("\n\n---\n\n")}`,
+      );
+    } else {
+      appendLine(ev, { type: "undelivered", texts });
+    }
   });
 }
 
@@ -369,7 +392,7 @@ function truncate(s, n) {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
-const WAKE = new Set(["question", "message", "turn_done", "turn_failed", "turn_cancelled", "question_timeout"]);
+const WAKE = new Set(["question", "message", "turn_done", "turn_failed", "turn_cancelled", "question_timeout", "undelivered"]);
 
 function formatEvents(events) {
   const lines = [];
@@ -386,9 +409,13 @@ function formatEvents(events) {
     else if (e.type === "question")
       lines.push(`## QUESTION from Codex (question_id=${e.qid}) — Codex is blocked until you answer with codex_send\n${e.text}`);
     else if (e.type === "question_timeout") lines.push(`## Question ${e.qid} timed out; Codex proceeded on its own judgment.`);
-    else if (e.type === "turn_done") lines.push(`## Codex finished the turn. Final answer:\n${e.text}`);
-    else if (e.type === "turn_failed") lines.push(`## Codex turn FAILED\n${e.text}`);
-    else if (e.type === "turn_cancelled") lines.push(`## Turn cancelled.`);
+    else if (e.type === "turn_done") lines.push(`## Codex finished turn ${e.turn ?? "?"}. Final answer:\n${e.text}`);
+    else if (e.type === "turn_failed") lines.push(`## Codex turn ${e.turn ?? "?"} FAILED\n${e.text}`);
+    else if (e.type === "turn_cancelled") lines.push(`## Turn ${e.turn ?? "?"} cancelled.`);
+    else if (e.type === "auto_resume")
+      lines.push(`## Codex ended the turn before reading your ${e.count} queued message(s); started turn ${e.turn} to deliver them. Call codex_wait for its answer.`);
+    else if (e.type === "undelivered")
+      lines.push(`## These queued messages never reached Codex (the turn did not finish cleanly); resend them if still relevant:\n${e.texts.map((t) => `- ${t}`).join("\n")}`);
   }
   return lines.join("\n\n");
 }
@@ -396,12 +423,8 @@ function formatEvents(events) {
 async function waitForEvents(jobId, timeoutSec) {
   const deadline = Date.now() + timeoutSec * 1000;
   for (;;) {
-    const all = readLines(eventsPath(jobId));
-    const fresh = all.slice(getCursor(jobId));
-    if (fresh.some((e) => WAKE.has(e.type)) || Date.now() >= deadline) {
-      setCursor(jobId, all.length);
-      return fresh;
-    }
+    const fresh = readLines(eventsPath(jobId)).slice(getCursor(jobId));
+    if (fresh.some((e) => WAKE.has(e.type)) || Date.now() >= deadline) return takeUnread(jobId);
     await sleep(1000);
   }
 }
@@ -425,7 +448,7 @@ async function runClaudeSide() {
       writeJson(metaPath(m.id), m);
     }
   }
-  const server = new McpServer({ name: "codex", version: "1.0.0" });
+  const server = new McpServer({ name: "codex", version: VERSION });
 
   server.registerTool(
     "codex_start",
@@ -527,8 +550,13 @@ async function runClaudeSide() {
         return text(`Queued; Codex receives it on its next claude_bridge tool call.\n${statusLine(job_id)}`);
       }
       if (!meta.session_id) throw new Error("This job has no Codex session to resume.");
+      // Flush the previous turn's unread output now, so codex_wait only reports the new turn.
+      const unread = formatEvents(takeUnread(job_id));
       runTurn(job_id, message);
-      return text(`New turn started in the same Codex session.\n${statusLine(job_id)}`);
+      return text(
+        `New turn started in the same Codex session.\n${statusLine(job_id)}` +
+          (unread ? `\n\n# Unread output from the previous turn (already finished)\n\n${unread}` : ""),
+      );
     },
   );
 

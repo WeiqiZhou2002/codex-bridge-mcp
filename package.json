@@ -1,8 +1,9 @@
 {
   "name": "codex-bridge-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "scripts": {
-    "check": "node --check server.mjs"
+    "check": "node --check server.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": [
     "mcp",

@@ -80,6 +80,14 @@ Follow-up turns use `codex exec resume <session_id>`. Job metadata persists on d
 - Codex's `--json` event format is not a stable API. If a Codex upgrade changes it, the activity digest may get thinner, but final answers still come through.
 - Two jobs in the same folder do not share context. Claude relays between them.
 
+## Development
+
+```bash
+npm test
+```
+
+The tests drive the server through a real MCP client against a fake `codex` binary (`test/fake-codex.mjs`), so they are fast and don't spend tokens. Set `CODEX_BIN` to point the bridge at a different Codex executable.
+
 ## License
 
 MIT
